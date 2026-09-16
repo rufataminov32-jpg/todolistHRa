@@ -26,20 +26,11 @@ function adminOnly(req, res, next) {
   next();
 }
 
-function parseTask(t) {
-  return {
-    ...t,
-    tags: JSON.parse(t.tags || '[]'),
-    subtasks: JSON.parse(t.subtasks || '[]'),
-    comments: JSON.parse(t.comments || '[]'),
-  };
-}
-
 // ── Auth ──
 app.post('/api/auth/login', (req, res) => {
   const { login, password } = req.body || {};
   if (!login || !password) return res.status(400).json({ error: 'Login va parol kiritish majburiy' });
-  const u = db.prepare('SELECT * FROM users WHERE login = ?').get(login);
+  const u = db.getUserByLogin(login);
   if (!u || !bcrypt.compareSync(password, u.password_hash))
     return res.status(401).json({ error: 'Login yoki parol noto\'g\'ri' });
   const token = jwt.sign(
@@ -50,103 +41,68 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.get('/api/me', auth, (req, res) => {
-  const u = db.prepare('SELECT id,login,name,role,created_at FROM users WHERE id=?').get(req.user.id);
-  res.json(u);
+  const u = db.getUser(req.user.id);
+  if (!u) return res.status(404).json({ error: 'Topilmadi' });
+  const { password_hash, ...safe } = u;
+  res.json(safe);
 });
 
 // ── Tasks ──
-app.get('/api/tasks', auth, (req, res) => {
-  res.json(db.prepare('SELECT * FROM tasks ORDER BY created_at DESC').all().map(parseTask));
-});
+app.get('/api/tasks', auth, (req, res) => res.json(db.getTasks()));
 
 app.post('/api/tasks', auth, (req, res) => {
-  const {
-    title, description = '', status = 'todo', priority = 'medium',
-    category = '', assigned_to = null, due_date = null, end_date = null,
-    recurring_type = null, recurring_interval = 1,
-    tags = [], subtasks = [], comments = []
-  } = req.body || {};
+  const { title, description='', status='todo', priority='medium', category='',
+          assigned_to=null, due_date=null, end_date=null,
+          recurring_type=null, recurring_interval=1,
+          tags=[], subtasks=[], comments=[] } = req.body || {};
   if (!title?.trim()) return res.status(400).json({ error: 'Sarlavha majburiy' });
-
-  const r = db.prepare(`
-    INSERT INTO tasks
-      (title,description,status,priority,category,assigned_to,due_date,end_date,
-       recurring_type,recurring_interval,tags,subtasks,comments,created_by)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-  `).run(title.trim(), description, status, priority, category, assigned_to,
-         due_date, end_date, recurring_type, recurring_interval,
-         JSON.stringify(tags), JSON.stringify(subtasks), JSON.stringify(comments), req.user.id);
-
-  res.status(201).json(parseTask(db.prepare('SELECT * FROM tasks WHERE id=?').get(r.lastInsertRowid)));
+  const task = db.addTask({
+    title: title.trim(), description, status, priority, category,
+    assigned_to, due_date, end_date, recurring_type, recurring_interval,
+    tags, subtasks, comments, created_by: req.user.id
+  });
+  res.status(201).json(task);
 });
 
 app.put('/api/tasks/:id', auth, (req, res) => {
-  if (!db.prepare('SELECT id FROM tasks WHERE id=?').get(req.params.id))
-    return res.status(404).json({ error: 'Vazifa topilmadi' });
-
-  const scalar = ['title','description','status','priority','category','assigned_to','due_date','end_date','recurring_type','recurring_interval'];
-  const json   = ['tags','subtasks','comments'];
-  const sets = {}, vals = [];
-
-  scalar.forEach(f => { if (req.body[f] !== undefined) { sets[f] = '?'; vals.push(req.body[f]); } });
-  json.forEach(f   => { if (req.body[f] !== undefined) { sets[f] = '?'; vals.push(JSON.stringify(req.body[f])); } });
-  sets['updated_at'] = '?'; vals.push(new Date().toISOString());
-
-  const clause = Object.keys(sets).map(k => `${k}=?`).join(',');
-  db.prepare(`UPDATE tasks SET ${clause} WHERE id=?`).run(...vals, req.params.id);
-  res.json(parseTask(db.prepare('SELECT * FROM tasks WHERE id=?').get(req.params.id)));
+  if (!db.getTask(req.params.id)) return res.status(404).json({ error: 'Vazifa topilmadi' });
+  const allowed = ['title','description','status','priority','category','assigned_to',
+                   'due_date','end_date','recurring_type','recurring_interval','tags','subtasks','comments'];
+  const updates = {};
+  allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+  const updated = db.updateTask(req.params.id, updates);
+  res.json(updated);
 });
 
 app.delete('/api/tasks/:id', auth, (req, res) => {
-  const r = db.prepare('DELETE FROM tasks WHERE id=?').run(req.params.id);
-  if (r.changes === 0) return res.status(404).json({ error: 'Vazifa topilmadi' });
+  if (!db.deleteTask(req.params.id)) return res.status(404).json({ error: 'Vazifa topilmadi' });
   res.json({ ok: true });
 });
 
-// ── Users (admin) ──
-app.get('/api/users', auth, adminOnly, (req, res) => {
-  res.json(db.prepare('SELECT id,login,name,role,created_at FROM users ORDER BY id').all());
-});
+// ── Users ──
+app.get('/api/users', auth, adminOnly, (req, res) => res.json(db.getUsers()));
 
 app.post('/api/users', auth, adminOnly, (req, res) => {
-  const { login, password, name, role = 'viewer' } = req.body || {};
+  const { login, password, name, role='viewer' } = req.body || {};
   if (!login || !password || !name) return res.status(400).json({ error: 'Login, parol va ism kerak' });
-  try {
-    const r = db.prepare('INSERT INTO users (login,password_hash,name,role) VALUES (?,?,?,?)')
-      .run(login, bcrypt.hashSync(password, 10), name, role);
-    res.status(201).json(db.prepare('SELECT id,login,name,role,created_at FROM users WHERE id=?').get(r.lastInsertRowid));
-  } catch (e) {
-    if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'Bu login band' });
-    throw e;
-  }
-});
-
-app.put('/api/users/:id/password', auth, adminOnly, (req, res) => {
-  const { password } = req.body || {};
-  if (!password) return res.status(400).json({ error: 'Yangi parol kerak' });
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password, 10), req.params.id);
-  res.json({ ok: true });
+  const existing = db.getUserByLogin(login);
+  if (existing) return res.status(409).json({ error: 'Bu login band' });
+  const user = db.addUser({ login, password_hash: bcrypt.hashSync(password, 10), name, role });
+  res.status(201).json(user);
 });
 
 app.delete('/api/users/:id', auth, adminOnly, (req, res) => {
   if (parseInt(req.params.id) === req.user.id)
     return res.status(400).json({ error: 'O\'zingizni o\'chira olmaysiz' });
-  const r = db.prepare('DELETE FROM users WHERE id=?').run(req.params.id);
-  if (r.changes === 0) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
+  if (!db.deleteUser(req.params.id)) return res.status(404).json({ error: 'Foydalanuvchi topilmadi' });
   res.json({ ok: true });
 });
 
 // ── Config ──
-app.get('/api/config', auth, (req, res) => {
-  const cfg = {};
-  db.prepare('SELECT key,value FROM config').all().forEach(r => { cfg[r.key] = JSON.parse(r.value); });
-  res.json(cfg);
-});
+app.get('/api/config', auth, (req, res) => res.json(db.getConfig()));
 
 app.put('/api/config', auth, adminOnly, (req, res) => {
-  const upsert = db.prepare('INSERT OR REPLACE INTO config (key,value) VALUES (?,?)');
-  db.transaction(entries => entries.forEach(([k, v]) => upsert.run(k, JSON.stringify(v))))(Object.entries(req.body));
-  res.json({ ok: true });
+  res.json(db.updateConfig(req.body));
 });
 
 // SPA fallback
